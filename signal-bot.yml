@@ -2,12 +2,12 @@ name: Signal Bot
 
 on:
   schedule:
-    - cron: "*/15 * * * 1-5"
+    - cron: "30 23 * * 1-5"
   workflow_dispatch:
     inputs:
       run_mode:
-        description: "test / backtest / live"
-        default: "test"
+        description: "daily / daily_status / test / gold / pa / backtest"
+        default: "daily_status"
 
 permissions:
   contents: write
@@ -33,13 +33,13 @@ jobs:
       - name: Run bot
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          RUN_MODE: ${{ github.event.inputs.run_mode || 'live' }}
+          RUN_MODE: ${{ github.event.inputs.run_mode || 'daily' }}
         run: python signals.py
 
       - name: Save state
-        if: ${{ github.event.inputs.run_mode == '' || github.event.inputs.run_mode == 'live' }}
+        if: ${{ github.event.inputs.run_mode == '' || github.event.inputs.run_mode == 'daily' }}
         run: |
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
-          git add state.json || true
+          git add -A
           git diff --cached --quiet || (git commit -m "update state" && git push)
