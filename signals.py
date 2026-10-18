@@ -6,8 +6,10 @@
   live      สแกนตลาดแล้วส่งซิกใหม่เข้า Discord (ค่าเริ่มต้น)
   test      ส่งข้อความทดสอบว่า Discord เชื่อมต่อได้
   backtest  ทดสอบกลยุทธ์ย้อนหลัง แล้วส่งสรุปวินเรทเข้า Discord
+  gold      ทดสอบเทรนด์ฟอลโลว์ทองรายวัน 25 ปี (Donchian breakout + trailing) แยก train/test
   pa        ทดสอบกลยุทธ์ Price Action บน 1H (Breakout, Sweep, Retest) แยก train/test + จำลองพอร์ต
   research  ทดสอบหลายชุดตัวกรอง แยก train/test เพื่อหาชุดที่ไม่ใช่แค่โชคดีย้อนหลัง
+  gold      ทดสอบเทรนด์ฟอลโลว์ทองรายวัน 25 ปี (Donchian breakout + trailing) แยก train/test
   pa        ทดสอบกลยุทธ์ Price Action บน 1H (Breakout/Retest/Sweep) แยก train/test
 
 หลักการ: เทรดตามเทรนด์ใหญ่ รอราคาย่อมาโซนมูลค่า (EMA21) แล้วมีแท่งเทียนยืนยัน
@@ -1046,6 +1048,99 @@ def run_pa_research():
     print(text)
     send_long(text)
 
+
+# ------------------------------------------------------ ทองคำ รายวัน 25 ปี
+def sim_chand(X, i, entry, sl, cost_px, mult=3.0, maxb=400):
+    """ออกด้วย Chandelier: สูงสุดนับจากเข้า ลบ mult*ATR (เลื่อนขึ้นอย่างเดียว)"""
+    risk = entry - sl
+    stop = sl
+    top = entry
+    n = len(X["c"])
+    end = min(n - 1, i + maxb)
+    for j in range(i + 1, end + 1):
+        if X["l"][j] <= stop:
+            px = X["o"][j] if X["o"][j] < stop else stop
+            return (px - entry - cost_px) / risk, j
+        top = max(top, X["h"][j])
+        stop = max(stop, top - mult * X["atr"][j])
+    return (X["c"][end] - entry - cost_px) / risk, end
+
+
+def run_gold_research():
+    df = download("GC=F", "1d", "max")
+    if df is None or len(df) < 1500:
+        send(content="ดึงข้อมูลทองรายวันไม่สำเร็จ ลองรันใหม่อีกครั้ง")
+        return
+    df = drop_open_bar(df, "1d")
+    o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    n = len(df)
+    dates = df.index
+    a = atr_np(h, l, c, 20)
+    views = {1: dict(o=o, h=h, l=l, c=c, atr=a), -1: dict(o=-o, h=-l, l=-h, c=-c, atr=a)}
+    split = int(n * TRAIN_FRAC)
+    years = (dates[-1] - dates[0]).days / 365.25
+    rows = {}
+    for N in (20, 55, 100):
+        hh = pd.Series(h).rolling(N).max().shift(1).to_numpy()
+        ll = pd.Series(l).rolling(N).min().shift(1).to_numpy()
+        for dirn in ("both", "long"):
+            for ex in ("HALF", "CHAND"):
+                trades = []
+                i = N + 1
+                while i < n - 2:
+                    sg = 1 if c[i] > hh[i] else (-1 if (dirn == "both" and c[i] < ll[i]) else 0)
+                    if sg == 0:
+                        i += 1
+                        continue
+                    X = views[sg]
+                    e = X["o"][i + 1]
+                    sl = e - 2 * a[i]
+                    cost_px = 0.0003 * abs(e)
+                    if ex == "HALF":
+                        R, j = sim_trail(X, i, e, sl, cost_px, M=max(N // 2, 5), maxb=400)
+                    else:
+                        R, j = sim_chand(X, i, e, sl, cost_px)
+                    trades.append((i + 1, R, sg))
+                    i = j + 1
+                rows[(N, dirn, ex)] = trades
+
+    lines = [f"**ทองคำรายวัน (GC=F) {dates[0].year}-{dates[-1].year}** train {dates[0].year}-{dates[split].year} | test {dates[split].year}-{dates[-1].year}",
+             "เข้าที่ราคาเปิดแท่งถัดไป SL เริ่มต้น 2 ATR หักต้นทุน 0.03% ต่อไม้ | รูปแบบ ไม้/PF",
+             "✅ = PF ≥ 1.2 ทั้งสองช่วง และมี ≥ 30 ไม้ต่อช่วง"]
+    ranked = []
+    for key, tr in rows.items():
+        a_ = [x[1] for x in tr if x[0] < split]
+        b_ = [x[1] for x in tr if x[0] >= split]
+        ok = len(a_) >= 30 and len(b_) >= 30 and pf_of(a_) >= 1.2 and pf_of(b_) >= 1.2
+        ranked.append((pf_of(a_) if len(a_) >= 30 else -1, key, a_, b_, ok))
+    ranked.sort(key=lambda x: -x[0])
+    for _, key, a_, b_, ok in ranked:
+        avg = f" {np.mean(b_):+.2f}R" if b_ else ""
+        lines.append(f"{'✅' if ok else '•'} N{key[0]}|{key[1]}|{key[2]}: train {pa_line(a_)} | test {pa_line(b_)}{avg}")
+    lines.append(f"\nผ่านเกณฑ์: {sum(1 for r in ranked if r[4])} จาก {len(ranked)} ชุด")
+    lines.append(f"ทองขึ้นช่วง test: {c[-1] / c[split]:.2f} เท่า (ถ้าเทรดแค่ฝั่งซื้อ ผลจะได้อานิสงส์จากขาขึ้นนี้)")
+    best = next((r for r in ranked if r[0] > 0), None)
+    if best:
+        _, key, a_, b_, ok = best
+        tr = rows[key]
+        lines.append(f"\nชุดที่เลือกจาก train เท่านั้น: N{key[0]}|{key[1]}|{key[2]}")
+        for k in range(5):
+            lo, hi = int(n * k / 5), int(n * (k + 1) / 5)
+            seg = [x[1] for x in tr if lo <= x[0] < hi]
+            lines.append(f"ช่วง {dates[lo].year}-{dates[min(hi, n) - 1].year}: {pa_line(seg)}" + (f" เฉลี่ย {np.mean(seg):+.2f}R" if seg else ""))
+        for sg, nm in ((1, "ซื้อ"), (-1, "ขาย")):
+            seg = [x[1] for x in tr if x[0] >= split and x[2] == sg]
+            lines.append(f"test ฝั่ง{nm}: {pa_line(seg)}")
+        if b_:
+            per_year = len(tr) / years
+            avg = float(np.mean(b_))
+            lines.append(f"\nประมาณ {per_year:.0f} ไม้/ปี เฉลี่ย {avg:+.2f}R/ไม้ (test)")
+            for risk in (0.01, 0.02, 0.05):
+                lines.append(f"เสี่ยง {int(risk * 100)}%/ไม้ → ราว {avg * per_year * risk * 100:+.0f}% ต่อปี (ประมาณการหยาบ ไม่รวมการทบต้นและช่วงขาดทุน)")
+    text = "\n".join(lines)
+    print(text)
+    send_long(text)
+
 # --------------------------------------------------------------------- main
 def main():
     if RUN_MODE == "test":
@@ -1056,8 +1151,12 @@ def main():
         run_research()
     elif RUN_MODE == "pa":
         run_pa_research()
+    elif RUN_MODE == "gold":
+        run_gold_research()
     elif RUN_MODE == "pa":
         run_pa_research()
+    elif RUN_MODE == "gold":
+        run_gold_research()
     else:
         run_live()
 
