@@ -1,0 +1,45 @@
+name: Signal Bot
+
+on:
+  schedule:
+    - cron: "*/15 * * * 1-5"
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "test / backtest / live"
+        default: "test"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: signal-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          RUN_MODE: ${{ github.event.inputs.run_mode || 'live' }}
+        run: python signals.py
+
+      - name: Save state
+        if: ${{ github.event.inputs.run_mode == '' || github.event.inputs.run_mode == 'live' }}
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          git add state.json || true
+          git diff --cached --quiet || (git commit -m "update state" && git push)
