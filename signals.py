@@ -556,4 +556,23 @@ def run_research():
             for sym in SYMBOLS:
                 a = [x[2] for x in tr if x[0] == sym and not x[1]]
                 b = [x[2] for x in tr if x[0] == sym and x[1]]
-       
+                lines.append(f"{sym}: train {short(a)} | test {short(b)}")
+        text = "\n".join(lines)
+        print(text)
+        send_long(text)
+    send(content="หมายเหตุ: ไม่ควรเชื่อชุดที่ดีแค่ train หรือมีไม้น้อย ให้เชื่อเฉพาะชุดที่ผ่านทั้ง train และ test และยังต้องทดสอบบนเดโมต่อ")
+
+# --------------------------------------------------------------------- main
+def main():
+    if RUN_MODE == "test":
+        send(content="✅ ทดสอบสำเร็จ: บอทเชื่อมต่อ Discord ได้แล้ว")
+    elif RUN_MODE == "backtest":
+        run_backtest()
+    elif RUN_MODE == "research":
+        run_research()
+    else:
+        run_live()
+
+
+if __name__ == "__main__":
+    main()
