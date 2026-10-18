@@ -8,6 +8,7 @@
   backtest  ทดสอบกลยุทธ์ย้อนหลัง แล้วส่งสรุปวินเรทเข้า Discord
   daily         บอททองรายวัน (ซิกเข้า/เลื่อน SL/ออก) ตั้งเวลารันวันละครั้ง
   journal       ส่งรายงานสมุดบันทึกเทรด + เช็กสุขภาพกลยุทธ์
+  rev           ทดสอบกลับตัวหลังเหวี่ยงแรงบนทอง 1H (ATR+RSI+โซน 4H+ตลาดสงบ/หลังข่าว) train/test
   wf            ทดสอบว่า "การเรียนรู้/ปรับพารามิเตอร์รายปี" ดีกว่าค่าคงที่ไหม (ทอง 26 ปี)
   daily_status  ส่งสถานะบอททองตอนนี้ (ระดับทะลุ ATR สถานะไม้) เพื่อเช็กว่าบอททำงาน
   gold      ทดสอบเทรนด์ฟอลโลว์ทองรายวัน 25 ปี (Donchian breakout + trailing) แยก train/test
@@ -15,6 +16,7 @@
   research  ทดสอบหลายชุดตัวกรอง แยก train/test เพื่อหาชุดที่ไม่ใช่แค่โชคดีย้อนหลัง
   daily         บอททองรายวัน (ซิกเข้า/เลื่อน SL/ออก) ตั้งเวลารันวันละครั้ง
   journal       ส่งรายงานสมุดบันทึกเทรด + เช็กสุขภาพกลยุทธ์
+  rev           ทดสอบกลับตัวหลังเหวี่ยงแรงบนทอง 1H (ATR+RSI+โซน 4H+ตลาดสงบ/หลังข่าว) train/test
   wf            ทดสอบว่า "การเรียนรู้/ปรับพารามิเตอร์รายปี" ดีกว่าค่าคงที่ไหม (ทอง 26 ปี)
   daily_status  ส่งสถานะบอททองตอนนี้ (ระดับทะลุ ATR สถานะไม้) เพื่อเช็กว่าบอททำงาน
   gold      ทดสอบเทรนด์ฟอลโลว์ทองรายวัน 25 ปี (Donchian breakout + trailing) แยก train/test
@@ -1447,6 +1449,151 @@ def run_gold_wf():
     print(text)
     send_long(text)
 
+
+# --------------------------------- ทองคำ 1H: กลับตัวหลังเหวี่ยงแรง (Exhaustion Reversal)
+def map_series(series, tf, times):
+    """แปลงค่าจากกรอบใหญ่มากรอบเล็ก โดยใช้เฉพาะแท่งใหญ่ที่ปิดแล้ว"""
+    t = pd.Series(series.values, index=series.index + pd.Timedelta(minutes=TF_MIN[tf]))
+    t = t[~t.index.duplicated(keep="last")]
+    return t.reindex(times, method="ffill").to_numpy()
+
+
+def sim_to(X, i, entry, sl, tp, cost_px, maxb=48):
+    risk = entry - sl
+    n = len(X["c"])
+    end = min(n - 1, i + maxb)
+    for j in range(i + 1, end + 1):
+        if X["l"][j] <= sl:
+            px = X["o"][j] if X["o"][j] < sl else sl
+            return (px - entry - cost_px) / risk, j
+        if X["h"][j] >= tp:
+            return (tp - entry - cost_px) / risk, j
+    return (X["c"][end] - entry - cost_px) / risk, end
+
+
+def run_rev_research():
+    df = download("GC=F", "1h", "730d")
+    if df is None or len(df) < 3000:
+        send(content="ดึงข้อมูลทอง 1H ไม่สำเร็จ ลองรันใหม่อีกครั้ง")
+        return
+    df = drop_open_bar(df, "1h")
+    h4 = drop_open_bar(resample(df, "4h"), "4h")
+    n = len(df)
+    times = df.index + pd.Timedelta(minutes=60)
+    o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    a = atr_np(h, l, c, 14)
+    a100 = atr_np(h, l, c, 100)
+    mean20 = pd.Series(c).rolling(20).mean().to_numpy()
+    rs = rsi(pd.Series(c)).to_numpy()
+    rng = h - l
+    hour = df.index.hour.to_numpy()
+    h4h, h4l = h4["high"].to_numpy(float), h4["low"].to_numpy(float)
+    sh1, _, sl1, _, _, _ = pivots(h4h, h4l, 2)
+    zl = map_series(pd.Series(sl1, index=h4.index), "4h", times)
+    zh = map_series(pd.Series(sh1, index=h4.index), "4h", times)
+
+    # สภาวะตลาด: 'ชุลมุน' = ATR พุ่ง / มีแท่งสปาร์กใหญ่ / ชั่วโมงข่าวสหรัฐ
+    bigbar = (pd.Series(rng) >= 2.5 * pd.Series(a).shift(1)).astype(float)
+    sp4 = bigbar.rolling(4).max().to_numpy() > 0
+    sp_before = bigbar.rolling(10).max().shift(3).to_numpy() > 0
+    r2 = pd.Series(rng).rolling(2).max().to_numpy()
+    with np.errstate(all="ignore"):
+        ratio = a / np.where(a100 > 0, a100, np.nan)
+        calm_now = r2 <= 1.5 * a
+        calm = (ratio <= 1.3) & (~sp4) & (~np.isin(hour, [12, 13, 14]))
+        aftermath = sp_before & calm_now
+
+    views = {
+        1: dict(o=o, h=h, l=l, c=c, mean=mean20, rsi=rs, z=zl),
+        -1: dict(o=-o, h=-l, l=-h, c=-c, mean=-mean20, rsi=100 - rs, z=-zh),
+    }
+    masks = {}
+    for s_, V in views.items():
+        with np.errstate(all="ignore"):
+            ext = (V["mean"] - V["l"]) / a >= 2.5
+            rej = (V["c"] > V["o"]) & (np.where(rng > 0, (V["c"] - V["l"]) / np.where(rng > 0, rng, 1), 0) >= 0.6)
+            rsf = pd.Series(V["rsi"]).rolling(3).min().to_numpy() <= 30
+            z = V["z"]
+            zone = (V["l"] <= z + 0.5 * a) & (V["c"] > z - 0.5 * a) & (V["l"] >= z - 1.5 * a)
+            m0 = ext & rej
+            masks[s_] = {
+                "V1 ขยาย+แท่งปฏิเสธ": m0,
+                "V2 +RSI": m0 & rsf,
+                "V3 +โซน4H": m0 & rsf & zone,
+                "V4 +ตลาดสงบ": m0 & rsf & zone & calm,
+                "V5 +หลังข่าว(aftermath)": m0 & rsf & aftermath,
+                "V6 โซน4H+aftermath": m0 & rsf & zone & aftermath,
+            }
+    exits = ("1R", "1.5R", "MEAN")
+    rows = {}
+    days = max(df.index.normalize().nunique(), 1)
+    cost_px = 0.45
+    for vname in masks[1]:
+        cands = []
+        for s_ in (1, -1):
+            for i in np.where(masks[s_][vname])[0]:
+                if 120 <= i < n - 3:
+                    cands.append((int(i), s_))
+        cands.sort()
+        for ex in exits:
+            out = rows.setdefault((vname, ex), [])
+            free = 0
+            for i, s_ in cands:
+                if i < free:
+                    continue
+                V = views[s_]
+                e = V["o"][i + 1]
+                sl = V["l"][i] - 0.2 * a[i]
+                risk = e - sl
+                if risk > 2.5 * a[i]:
+                    continue
+                if risk < 0.8 * a[i]:
+                    sl = e - 0.8 * a[i]
+                    risk = 0.8 * a[i]
+                if ex == "MEAN":
+                    tp = V["mean"][i]
+                    if not (tp - e >= 0.8 * risk):
+                        continue
+                else:
+                    tp = e + float(ex[:-1]) * risk
+                R, j = sim_to(V, i, e, sl, tp, cost_px)
+                out.append((i / n, R, bool(calm[i]), risk, int(hour[i])))
+                free = j + 1
+
+    lines = ["**ทองคำ 1H: กลับตัวหลังเหวี่ยงแรง** (ข้อมูล 2 ปี | train 60% เก่า / test 40% ใหม่)",
+             "เงื่อนไข: ราคาเหวี่ยงห่างค่าเฉลี่ย ≥ 2.5 ATR + แท่งปฏิเสธ (+RSI ≤30, โซน swing 4H, ตลาดสงบ, หลังข่าว ตามชื่อชุด)",
+             "เข้าที่เปิดแท่งถัดไป, SL เลยจุดสุด, หักต้นทุน $0.45/ออนซ์ | รูปแบบ ไม้/PF",
+             "✅ = PF ≥ 1.2 ทั้งสองช่วง, train ≥ 60 ไม้, test ≥ 40 ไม้"]
+    ranked = []
+    for key, tr in rows.items():
+        a_ = [x[1] for x in tr if x[0] < TRAIN_FRAC]
+        b_ = [x[1] for x in tr if x[0] >= TRAIN_FRAC]
+        ok = len(a_) >= 60 and len(b_) >= 40 and pf_of(a_) >= 1.2 and pf_of(b_) >= 1.2
+        ranked.append((pf_of(a_) if len(a_) >= 60 else -1, key, a_, b_, ok, len(tr)))
+    ranked.sort(key=lambda x: -x[0])
+    for _, key, a_, b_, ok, tot in ranked:
+        avg = f" {np.mean(b_):+.2f}R" if b_ else ""
+        lines.append(f"{'✅' if ok else '•'} {key[0]}|{key[1]}: train {pa_line(a_)} | test {pa_line(b_)}{avg} | {tot / days:.2f} ไม้/วัน")
+    lines.append(f"\nผ่านเกณฑ์: {sum(1 for r in ranked if r[4])} จาก {len(ranked)} ชุด")
+    best = next((r for r in ranked if r[0] > 0), None)
+    if best:
+        _, key, a_, b_, ok, tot = best
+        tr = rows[key]
+        lines.append(f"\nชุดที่เลือกจาก train เท่านั้น: {key[0]}|{key[1]}")
+        calm_r = [x[1] for x in tr if x[2]]
+        wild_r = [x[1] for x in tr if not x[2]]
+        lines.append(f"ตลาดสงบ: {pa_line(calm_r)} | ตลาดชุลมุน: {pa_line(wild_r)}")
+        for nm, lo, hi in (("Asia 00-07 UTC", 0, 7), ("London 07-13 UTC", 7, 13), ("NY 13-21 UTC", 13, 21)):
+            seg = [x[1] for x in tr if lo <= x[4] < hi]
+            lines.append(f"{nm}: {pa_line(seg)}")
+        if tr:
+            avg_risk = float(np.mean([x[3] for x in tr]))
+            avg_r = float(np.mean([x[1] for x in tr]))
+            lines.append(f"\nSL เฉลี่ยห่าง ${avg_risk:.1f}/ออนซ์ | เฉลี่ย {avg_r:+.2f}R ≈ {avg_r * avg_risk:+.1f}$ ต่อไม้ที่ 0.01 ล็อต (ก่อนค่าคอม)")
+    text = "\n".join(lines)
+    print(text)
+    send_long(text)
+
 # --------------------------------------------------------------------- main
 def main():
     if RUN_MODE == "test":
@@ -1468,6 +1615,8 @@ def main():
         send(content="\n".join(["**สมุดบันทึกบอททอง**"] + jl + warns))
     elif RUN_MODE == "wf":
         run_gold_wf()
+    elif RUN_MODE == "rev":
+        run_rev_research()
     elif RUN_MODE == "pa":
         run_pa_research()
     elif RUN_MODE == "gold":
@@ -1481,6 +1630,8 @@ def main():
         send(content="\n".join(["**สมุดบันทึกบอททอง**"] + jl + warns))
     elif RUN_MODE == "wf":
         run_gold_wf()
+    elif RUN_MODE == "rev":
+        run_rev_research()
     else:
         run_live()
 
