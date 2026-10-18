@@ -6,7 +6,9 @@
   live      สแกนตลาดแล้วส่งซิกใหม่เข้า Discord (ค่าเริ่มต้น)
   test      ส่งข้อความทดสอบว่า Discord เชื่อมต่อได้
   backtest  ทดสอบกลยุทธ์ย้อนหลัง แล้วส่งสรุปวินเรทเข้า Discord
+  pa        ทดสอบกลยุทธ์ Price Action บน 1H (Breakout, Sweep, Retest) แยก train/test + จำลองพอร์ต
   research  ทดสอบหลายชุดตัวกรอง แยก train/test เพื่อหาชุดที่ไม่ใช่แค่โชคดีย้อนหลัง
+  pa        ทดสอบกลยุทธ์ Price Action บน 1H (Breakout/Retest/Sweep) แยก train/test
 
 หลักการ: เทรดตามเทรนด์ใหญ่ รอราคาย่อมาโซนมูลค่า (EMA21) แล้วมีแท่งเทียนยืนยัน
 ต้องผ่านหลายเงื่อนไขพร้อมกัน (RSI, MACD, ADX, EMA200) ใช้เฉพาะแท่งที่ปิดแล้ว (ไม่รีเพนต์)
@@ -89,15 +91,15 @@ def drop_open_bar(df, tf):
     return df[end <= now]
 
 
-def get_frames(ticker, deep=False):
-    d15 = download(ticker, "15m", "60d")
+def get_frames(ticker, deep=False, with15=True):
+    d15 = download(ticker, "15m", "60d") if with15 else None
     h1 = download(ticker, "1h", "730d" if deep else "120d")
     d1 = download(ticker, "1d", "5y" if deep else "2y")
-    if d15 is None or h1 is None or d1 is None:
+    if (with15 and d15 is None) or h1 is None or d1 is None:
         return None
     h1c = drop_open_bar(h1, "1h")
     return {
-        "15m": drop_open_bar(d15, "15m"),
+        "15m": drop_open_bar(d15, "15m") if with15 else h1c.iloc[0:0],
         "1h": h1c,
         "4h": drop_open_bar(resample(h1c, "4h"), "4h"),
         "1d": drop_open_bar(d1, "1d"),
@@ -562,6 +564,488 @@ def run_research():
         send_long(text)
     send(content="หมายเหตุ: ไม่ควรเชื่อชุดที่ดีแค่ train หรือมีไม้น้อย ให้เชื่อเฉพาะชุดที่ผ่านทั้ง train และ test และยังต้องทดสอบบนเดโมต่อ")
 
+
+# ------------------------------------------------- price action (1H) research
+def pivots(h, l, k=3):
+    """swing high/low แบบ fractal ยืนยันหลังผ่านไป k แท่ง (ไม่มองอนาคต)
+    คืนค่า: ระดับ swing high/low ล่าสุดที่ยืนยันแล้ว ณ แต่ละแท่ง"""
+    n = len(h)
+    sh = np.full(n, np.nan)
+    sl = np.full(n, np.nan)
+    last_h = last_l = np.nan
+    for i in range(n):
+        j = i - k
+        if j >= k:
+            if h[j] == h[j - k:i + 1].max():
+                last_h = h[j]
+            if l[j] == l[j - k:i + 1].min():
+                last_l = l[j]
+        sh[i], sl[i] = last_h, last_l
+    return sh, sl
+
+
+def pa_finish(X, i, sl, atr):
+    c = X["c"][i]
+    risk = c - sl
+    if risk < 1.0 * atr:
+        sl = c - 1.0 * atr
+        risk = 1.0 * atr
+    if risk > 2.5 * atr:  # SL กว้างเกินไป ไม่คุ้ม
+        return None
+    return dict(entry=c, sl=sl, risk=risk)
+
+
+def pa_check(X, i, kind):
+    """สัญญาณ Price Action ฝั่งซื้อ (ฝั่งขายใช้มุมมองกลับด้าน) ใช้เฉพาะแท่งที่ปิดแล้ว"""
+    if i < WARMUP:
+        return None
+    c, o, h, l = X["c"][i], X["o"][i], X["h"][i], X["l"][i]
+    atr = X["atr"][i]
+    rng = h - l
+    if not (atr > 0 and rng > 0):
+        return None
+
+    if kind in ("BRK20", "BRK40"):
+        # เบรกกรอบสูงสุด N แท่ง ด้วยแท่งแข็งแรง ADX ผ่าน และไม่ไล่ราคาไกลเกิน
+        n = 20 if kind == "BRK20" else 40
+        top = X["h"][i - n:i].max()
+        if not (c > top and c > o and (c - o) >= 0.5 * rng):
+            return None
+        if X["adx"][i] < 20 or c - top > 1.5 * atr:
+            return None
+        return pa_finish(X, i, X["l"][i - 4:i + 1].min() - 0.2 * atr, atr)
+
+    if kind == "RETEST":
+        # เบรก swing high แล้วย่อกลับมาทดสอบแนวเดิม (แนวต้านกลายเป็นแนวรับ) + แท่งเขียวยืนยัน
+        k = 12
+        lvl = X["sh"][i - k]
+        if np.isnan(lvl):
+            return None
+        if not (X["c"][i - k + 1:i].max() > lvl):
+            return None
+        if not (l <= lvl + 0.3 * atr and c > lvl and c > o):
+            return None
+        if X["l"][i - k + 1:i + 1].min() < lvl - 1.0 * atr:
+            return None
+        return pa_finish(X, i, min(l, lvl) - 0.3 * atr, atr)
+
+    if kind == "SWEEP":
+        # กวาด stop ใต้ swing low แล้วปิดกลับเหนือแนว (stop hunt) ตามเทรนด์ขึ้น
+        lvl = X["sl"][i - 1]
+        if np.isnan(lvl):
+            return None
+        if not (l < lvl and c > lvl and c > o):
+            return None
+        if (c - l) / rng < 0.6 or (lvl - l) > 1.5 * atr:
+            return None
+        return pa_finish(X, i, l - 0.2 * atr, atr)
+    return None
+
+
+def simulate_trail(X, i, r, k, n, cost=0.1, maxbars=200):
+    """ออกด้วย trailing stop (ตาม high สูงสุด - k*ATR) ปล่อยกำไรวิ่ง"""
+    entry, sl, risk = r["entry"], r["sl"], r["risk"]
+    hh = X["h"][i]
+    end = min(n - 1, i + maxbars)
+    for j in range(i + 1, end + 1):
+        if X["l"][j] <= sl:
+            return (sl - entry) / risk - cost, j
+        hh = max(hh, X["h"][j])
+        sl = max(sl, hh - k * X["atr"][j])
+    return (X["c"][end] - entry) / risk - cost, end
+
+
+PA_KINDS = ("BRK20", "BRK40", "RETEST", "SWEEP")
+PA_TRENDS = ("4h", "4h+1d")
+PA_EXITS = (("rr", 2.0), ("rr", 3.0), ("trail", 3.0))
+
+
+def monte_carlo(rs, risk, target=10.0, floor=0.2, trades=200, paths=3000, seed=1):
+    rng = np.random.default_rng(seed)
+    rs = np.array(rs)
+    hit = ruin = 0
+    finals = []
+    for _ in range(paths):
+        eq = 1.0
+        for r in rng.choice(rs, trades):
+            eq *= 1 + risk * r
+            if eq >= target:
+                hit += 1
+                break
+            if eq <= floor:
+                ruin += 1
+                break
+        finals.append(eq)
+    return hit / paths, ruin / paths, float(np.median(finals))
+
+
+def run_pa_research():
+    rows = {}  # (kind, trend, exit_label) -> list of (symbol, is_test, R)
+    for name, ticker in SYMBOLS.items():
+        fr = get_frames(ticker, deep=True)
+        if not fr:
+            print(name, "ไม่มีข้อมูล")
+            continue
+        trd, views = prep(fr)
+        ent = fr["1h"]
+        n = len(ent)
+        if n < WARMUP + 100:
+            continue
+        V = views["1h"]
+        for sgn in (1, -1):
+            V[sgn]["sh"], V[sgn]["sl"] = pivots(V[sgn]["h"], V[sgn]["l"])
+        times = ent.index + pd.Timedelta(minutes=60)
+        t4 = htf_at(trd["4h"], "4h", times).to_numpy()
+        t1d = htf_at(trd["1d"], "1d", times).to_numpy()
+        tar = {"4h": t4, "4h+1d": np.where(t4 == t1d, t4, 0)}
+        split = int(n * TRAIN_FRAC)
+        for kind in PA_KINDS:
+            for tname in PA_TRENDS:
+                tarr = tar[tname]
+                for ex in PA_EXITS:
+                    label = f"{ex[0]}{ex[1]:g}"
+                    out = rows.setdefault((kind, tname, label), [])
+                    i = WARMUP
+                    while i < n - 1:
+                        sg = int(tarr[i])
+                        if sg and in_session(times[i], (0, 24)):
+                            r = pa_check(V[sg], i, kind)
+                            if r:
+                                if ex[0] == "rr":
+                                    R, j = simulate(V[sg], i, r, ex[1], n)
+                                else:
+                                    R, j = simulate_trail(V[sg], i, r, ex[1], n)
+                                out.append((name, i >= split, R))
+                                i = j + 1
+                                continue
+                        i += 1
+        print(name, "เสร็จ")
+
+    lines = ["**Price Action 1H Research** (train 60% เก่า | test 40% ล่าสุด)"]
+    passed = []
+    nsym = len(SYMBOLS)
+    for key, tr in rows.items():
+        a = [x[2] for x in tr if not x[1]]
+        b = [x[2] for x in tr if x[1]]
+        sa, sb = stats(a), stats(b)
+        pos = 0
+        for sym in SYMBOLS:
+            bs = [x[2] for x in tr if x[0] == sym and x[1]]
+            st = stats(bs)
+            if st and st[0] >= 3 and st[3] > 1:
+                pos += 1
+        label = f"{key[0]}|{key[1]}|{key[2]}"
+        if sa and sb:
+            lines.append(f"{label}: train {sa[0]} ไม้ PF {sa[3]:.2f} | test {sb[0]} ไม้ PF {sb[3]:.2f} ({sb[2]:+.2f}R) | คู่บวก {pos}/{nsym}")
+            if sa[0] >= 60 and sb[0] >= 50 and sa[3] >= 1.2 and sb[3] >= 1.2 and pos >= 6:
+                passed.append((min(sa[3], sb[3]), key, label, b, sa, sb))
+        else:
+            lines.append(f"{label}: ไม้ไม่พอ")
+    lines.append("")
+    if passed:
+        passed.sort(reverse=True, key=lambda x: x[0])
+        lines.append("**ผ่านเกณฑ์** (PF ≥ 1.2 ทั้งสองช่วง, test ≥ 50 ไม้, คู่บวก ≥ 6):")
+        for _, _, label, _, sa, sb in passed:
+            lines.append(f"✅ {label}")
+    else:
+        lines.append("**ไม่มีชุดไหนผ่านเกณฑ์** (PF ≥ 1.2 ทั้งสองช่วง, test ≥ 50 ไม้, คู่บวก ≥ 6)")
+    send_long("\n".join(lines))
+    print("\n".join(lines))
+
+    if passed:
+        _, key, label, b, sa, sb = passed[0]
+        years = 730 / 365
+        per_year = len(rows[key]) / years
+        msg = [f"**จำลองการโตของพอร์ต** ด้วยชุด {label} (สุ่มจากผลไม้ช่วง test {len(b)} ไม้)",
+               f"ประมาณ {per_year:.0f} ไม้/ปี รวมทุกคู่ | เป้า 10 เท่า, ถือว่าพังถ้าเหลือ 20% ของทุน | 200 ไม้"]
+        for risk in (0.02, 0.05, 0.10):
+            hit, ruin, med = monte_carlo(b, risk)
+            msg.append(f"เสี่ยง {risk*100:.0f}%/ไม้: ถึง 10 เท่า {hit*100:.0f}% | พัง {ruin*100:.0f}% | ทุนกลาง {med:.1f}x")
+        msg.append("สมมติว่าอนาคตเหมือนช่วง test ซึ่งไม่แน่นอน และไม้แพ้ติดกันจริงอาจแย่กว่านี้")
+        send_long("\n".join(msg))
+
+
+# ------------------------------------------------- Price Action (1H) research
+# สเปรด+สลิปเพจโดยประมาณ (หน่วยราคา) ใช้คิดต้นทุนจริงต่อไม้ ตามขนาด SL
+SPREAD = {"XAUUSD": 0.30, "GBPJPY": 0.025, "GBPUSD": 0.00012, "EURUSD": 0.00010,
+          "USDJPY": 0.010, "EURJPY": 0.015, "AUDUSD": 0.00012, "USDCAD": 0.00015,
+          "NZDUSD": 0.00015}
+COST_MULT = 1.5  # สเปรด + สลิปเพจ ไป-กลับ
+
+
+def pivots(h, l, k):
+    """Swing high/low ที่ยืนยันแล้ว (ต้องรอ k แท่งหลังจุดนั้นปิด จึงไม่มองอนาคต)"""
+    n = len(h)
+    sh1 = np.full(n, np.nan); sh2 = np.full(n, np.nan)
+    sl1 = np.full(n, np.nan); sl2 = np.full(n, np.nan)
+    shi = np.full(n, -1); sli = np.full(n, -1)
+    hs, ls = [], []
+    for t in range(n):
+        p = t - k
+        if p >= k:
+            if h[p] == h[p - k:p + k + 1].max():
+                hs.append((p, h[p]))
+            if l[p] == l[p - k:p + k + 1].min():
+                ls.append((p, l[p]))
+        if hs:
+            sh1[t], shi[t] = hs[-1][1], hs[-1][0]
+            if len(hs) > 1:
+                sh2[t] = hs[-2][1]
+        if ls:
+            sl1[t], sli[t] = ls[-1][1], ls[-1][0]
+            if len(ls) > 1:
+                sl2[t] = ls[-2][1]
+    return sh1, sh2, sl1, sl2, shi, sli
+
+
+def struct_trend(df, k=2):
+    """โครงสร้างราคา: HH+HL = +1, LH+LL = -1, อื่นๆ = 0"""
+    h, l = df["high"].to_numpy(float), df["low"].to_numpy(float)
+    sh1, sh2, sl1, sl2, _, _ = pivots(h, l, k)
+    t = np.zeros(len(df), dtype=int)
+    t[(sh1 > sh2) & (sl1 > sl2)] = 1
+    t[(sh1 < sh2) & (sl1 < sl2)] = -1
+    return pd.Series(t, index=df.index)
+
+
+def atr_np(h, l, c, n=14):
+    hs, ls, cs = pd.Series(h), pd.Series(l), pd.Series(c)
+    tr = pd.concat([hs - ls, (hs - cs.shift()).abs(), (ls - cs.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean().fillna(0).to_numpy()
+
+
+def pa_view(o, h, l, c, a):
+    sh1, sh2, sl1, sl2, shi, sli = pivots(h, l, 3)
+    return dict(o=o, h=h, l=l, c=c, atr=a, sh1=sh1, sl1=sl1, shi=shi, sli=sli)
+
+
+def sig_breakout(X, N):
+    """ทะลุกรอบสูงสุด N แท่ง ด้วยแท่งแรงปิดใกล้ high"""
+    c, o, h, l, a = X["c"], X["o"], X["h"], X["l"], X["atr"]
+    hh = pd.Series(h).rolling(N).max().shift(1).to_numpy()
+    rng = h - l
+    strong = ((c - o) > 0.5 * a) & ((c - l) >= 0.7 * np.where(rng > 0, rng, np.nan))
+    brk = c > hh
+    first = brk & ~np.r_[False, brk[:-1]]
+    out = []
+    for i in np.where(first & strong)[0]:
+        if i < 60:
+            continue
+        entry = c[i]
+        sl = l[i - 7:i + 1].min() - 0.1 * a[i]
+        risk = entry - sl
+        if risk > 3 * a[i]:
+            continue
+        if risk < a[i]:
+            sl = entry - a[i]
+        out.append((int(i), entry, sl))
+    return out
+
+
+def sig_sweep(X):
+    """กวาด swing low (ล่า stop) แล้วปิดกลับเหนือระดับด้วยแท่งกลับตัว"""
+    c, o, h, l, a = X["c"], X["o"], X["h"], X["l"], X["atr"]
+    sl1, sli = X["sl1"], X["sli"]
+    out = []
+    for i in range(70, len(c)):
+        lv, li = sl1[i - 1], sli[i - 1]
+        if np.isnan(lv) or li < 0 or (i - 1 - li) > 80:
+            continue
+        rng = h[i] - l[i]
+        if rng <= 0:
+            continue
+        depth = lv - l[i]
+        if (l[i] < lv and c[i] > lv and c[i] > o[i] and (c[i] - l[i]) / rng >= 0.6
+                and 0.05 * a[i] <= depth <= 1.5 * a[i]):
+            entry = c[i]
+            sl = l[i] - 0.15 * a[i]
+            risk = entry - sl
+            if risk > 2.5 * a[i]:
+                continue
+            if risk < 0.7 * a[i]:
+                sl = entry - 0.7 * a[i]
+            out.append((i, entry, sl))
+    return out
+
+
+def sig_retest(X):
+    """ทะลุ swing high แล้วย่อกลับมาทดสอบระดับเดิมภายใน 12 แท่ง ได้แท่งยืนยัน"""
+    c, o, h, l, a = X["c"], X["o"], X["h"], X["l"], X["atr"]
+    sh1 = X["sh1"]
+    out, lvl, bidx = [], None, -1
+    for i in range(70, len(c)):
+        if lvl is not None:
+            rng = h[i] - l[i]
+            if i - bidx > 12 or c[i] < lvl - 0.5 * a[i]:
+                lvl = None
+            elif (i > bidx and rng > 0 and l[i] <= lvl + 0.25 * a[i] and c[i] > lvl
+                  and c[i] > o[i] and (c[i] - l[i]) / rng >= 0.55):
+                entry = c[i]
+                sl = min(l[i], lvl) - 0.25 * a[i]
+                risk = entry - sl
+                lvl = None
+                if risk <= 2.5 * a[i]:
+                    if risk < 0.7 * a[i]:
+                        sl = entry - 0.7 * a[i]
+                    out.append((i, entry, sl))
+                continue
+        L = sh1[i - 1]
+        if not np.isnan(L) and c[i] > L and c[i - 1] <= L and c[i] - L >= 0.3 * a[i]:
+            lvl, bidx = L, i
+    return out
+
+
+def sim_fixed(X, i, entry, sl, rr, cost_px, maxb=150):
+    risk = entry - sl
+    tp = entry + rr * risk
+    n = len(X["c"])
+    end = min(n - 1, i + maxb)
+    for j in range(i + 1, end + 1):
+        if X["l"][j] <= sl:
+            px = X["o"][j] if X["o"][j] < sl else sl
+            return (px - entry - cost_px) / risk, j
+        if X["h"][j] >= tp:
+            return (tp - entry - cost_px) / risk, j
+    return (X["c"][end] - entry - cost_px) / risk, end
+
+
+def sim_trail(X, i, entry, sl, cost_px, M=10, maxb=300):
+    risk = entry - sl
+    stop = sl
+    n = len(X["c"])
+    end = min(n - 1, i + maxb)
+    for j in range(i + 1, end + 1):
+        if X["l"][j] <= stop:
+            px = X["o"][j] if X["o"][j] < stop else stop
+            return (px - entry - cost_px) / risk, j
+        stop = max(stop, X["l"][j - M + 1:j + 1].min())
+    return (X["c"][end] - entry - cost_px) / risk, end
+
+
+PA_STRATS = ("BRK20", "BRK40", "SWEEP", "RETEST")
+PA_FILTERS = ("none", "4h", "1d")
+PA_EXITS = ("2R", "3R", "TRAIL")
+
+
+def pf_of(rs):
+    a = np.array(rs)
+    if len(a) == 0:
+        return 0.0
+    gl = -a[a < 0].sum()
+    return float("inf") if gl == 0 else a[a > 0].sum() / gl
+
+
+def pa_line(rs):
+    if not rs:
+        return "-"
+    return f"{len(rs)}/{pf_of(rs):.2f}"
+
+
+def mc_growth(rs, risk, trades=200, sims=2000, target=10.0, ruin=0.3):
+    rng = np.random.default_rng(1)
+    a = np.array(rs)
+    hit = dead = 0
+    finals = []
+    for _ in range(sims):
+        eq = 1.0
+        for r in rng.choice(a, trades):
+            eq *= 1 + risk * r
+            if eq >= target:
+                hit += 1
+                break
+            if eq <= ruin:
+                dead += 1
+                break
+        finals.append(eq)
+    return hit / sims * 100, dead / sims * 100, float(np.median(finals))
+
+
+def run_pa_research():
+    rows = {}
+    for name, ticker in SYMBOLS.items():
+        fr = get_frames(ticker, deep=True, with15=False)
+        if not fr or len(fr["1h"]) < 500:
+            print(name, "ไม่มีข้อมูลพอ")
+            continue
+        h1 = fr["1h"]
+        n = len(h1)
+        times = h1.index + pd.Timedelta(minutes=60)
+        o, h, l, c = (h1[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+        a = atr_np(h, l, c)
+        filt = {
+            "none": None,
+            "4h": htf_at(struct_trend(fr["4h"]), "4h", times).to_numpy(),
+            "1d": htf_at(struct_trend(fr["1d"]), "1d", times).to_numpy(),
+        }
+        views = {1: pa_view(o, h, l, c, a), -1: pa_view(-o, -l, -h, -c, a)}
+        cost_px = SPREAD.get(name, 0) * COST_MULT
+        for strat in PA_STRATS:
+            sigs = {}
+            for s_, X in views.items():
+                if strat == "BRK20":
+                    sigs[s_] = sig_breakout(X, 20)
+                elif strat == "BRK40":
+                    sigs[s_] = sig_breakout(X, 40)
+                elif strat == "SWEEP":
+                    sigs[s_] = sig_sweep(X)
+                else:
+                    sigs[s_] = sig_retest(X)
+            merged = sorted([(i, e, sl, s_) for s_ in sigs for (i, e, sl) in sigs[s_]])
+            for fname, F in filt.items():
+                for ex in PA_EXITS:
+                    out = rows.setdefault((strat, fname, ex), [])
+                    free = 0
+                    for i, e, sl, s_ in merged:
+                        if i < free:
+                            continue
+                        if F is not None and F[i] != s_:
+                            continue
+                        X = views[s_]
+                        if ex == "TRAIL":
+                            R, j = sim_trail(X, i, e, sl, cost_px)
+                        else:
+                            R, j = sim_fixed(X, i, e, sl, float(ex[0]), cost_px)
+                        out.append((name, i / n, R))
+                        free = j + 1
+        print(name, "เสร็จ")
+
+    lines = ["**Price Action 1H** (train 60% เก่า | test 40% ล่าสุด) รูปแบบ ไม้/PF", "✅ = PF ≥ 1.2 ทั้งสองช่วง, train ≥ 100 ไม้, test ≥ 60 ไม้"]
+    ranked = []
+    for key, tr in rows.items():
+        a_ = [x[2] for x in tr if x[1] < TRAIN_FRAC]
+        b_ = [x[2] for x in tr if x[1] >= TRAIN_FRAC]
+        ok = len(a_) >= 100 and len(b_) >= 60 and pf_of(a_) >= 1.2 and pf_of(b_) >= 1.2
+        ranked.append((pf_of(a_) if len(a_) >= 100 else -1, key, a_, b_, ok))
+    ranked.sort(key=lambda x: -x[0])
+    for _, key, a_, b_, ok in ranked:
+        avg = f" {np.mean(b_):+.2f}R" if b_ else ""
+        lines.append(f"{'✅' if ok else '•'} {key[0]}|{key[1]}|{key[2]}: train {pa_line(a_)} | test {pa_line(b_)}{avg}")
+    passed = [r for r in ranked if r[4]]
+    lines.append("")
+    lines.append(f"ผ่านเกณฑ์: {len(passed)} จาก {len(ranked)} ชุด (ทดสอบหลายชุด จึงมีโอกาสผ่านเพราะโชคได้)")
+    best = next((r for r in ranked if r[0] > 0), None)
+    if best:
+        _, key, a_, b_, ok = best
+        lines.append(f"\nชุดที่เลือกจาก train เท่านั้น: {key[0]}|{key[1]}|{key[2]}")
+        tr = rows[key]
+        for lo, hi in ((0, 1 / 3), (1 / 3, 2 / 3), (2 / 3, 1.01)):
+            seg = [x[2] for x in tr if lo <= x[1] < hi]
+            lines.append(f"ช่วงเวลา {int(lo * 3) + 1}/3: {pa_line(seg)}" + (f" เฉลี่ย {np.mean(seg):+.2f}R" if seg else ""))
+        lines.append("รายคู่ (test):")
+        for sym in SYMBOLS:
+            seg = [x[2] for x in tr if x[0] == sym and x[1] >= TRAIN_FRAC]
+            lines.append(f"{sym}: {pa_line(seg)}")
+        if len(b_) >= 30 and pf_of(b_) > 1:
+            lines.append("\nจำลองการเติบโตของพอร์ต 200 ไม้ (สุ่มจากผล test) เป้า 10 เท่า / ถือว่าพังเมื่อพอร์ตเหลือ 30%:")
+            for risk in (0.02, 0.05, 0.10):
+                hit, dead, med = mc_growth(b_, risk)
+                lines.append(f"เสี่ยง {int(risk * 100)}%/ไม้: ถึงเป้า {hit:.0f}% | พัง {dead:.0f}% | มัธยฐาน {med:.2f} เท่า")
+        else:
+            lines.append("\nชุดนี้ช่วง test ไม่ได้กำไร จึงไม่จำลองการเติบโตของพอร์ต")
+    text = "\n".join(lines)
+    print(text)
+    send_long(text)
+
 # --------------------------------------------------------------------- main
 def main():
     if RUN_MODE == "test":
@@ -570,6 +1054,10 @@ def main():
         run_backtest()
     elif RUN_MODE == "research":
         run_research()
+    elif RUN_MODE == "pa":
+        run_pa_research()
+    elif RUN_MODE == "pa":
+        run_pa_research()
     else:
         run_live()
 
