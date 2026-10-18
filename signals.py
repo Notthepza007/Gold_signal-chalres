@@ -6,9 +6,13 @@
   live      สแกนตลาดแล้วส่งซิกใหม่เข้า Discord (ค่าเริ่มต้น)
   test      ส่งข้อความทดสอบว่า Discord เชื่อมต่อได้
   backtest  ทดสอบกลยุทธ์ย้อนหลัง แล้วส่งสรุปวินเรทเข้า Discord
+  daily         บอททองรายวัน (ซิกเข้า/เลื่อน SL/ออก) ตั้งเวลารันวันละครั้ง
+  daily_status  ส่งสถานะบอททองตอนนี้ (ระดับทะลุ ATR สถานะไม้) เพื่อเช็กว่าบอททำงาน
   gold      ทดสอบเทรนด์ฟอลโลว์ทองรายวัน 25 ปี (Donchian breakout + trailing) แยก train/test
   pa        ทดสอบกลยุทธ์ Price Action บน 1H (Breakout, Sweep, Retest) แยก train/test + จำลองพอร์ต
   research  ทดสอบหลายชุดตัวกรอง แยก train/test เพื่อหาชุดที่ไม่ใช่แค่โชคดีย้อนหลัง
+  daily         บอททองรายวัน (ซิกเข้า/เลื่อน SL/ออก) ตั้งเวลารันวันละครั้ง
+  daily_status  ส่งสถานะบอททองตอนนี้ (ระดับทะลุ ATR สถานะไม้) เพื่อเช็กว่าบอททำงาน
   gold      ทดสอบเทรนด์ฟอลโลว์ทองรายวัน 25 ปี (Donchian breakout + trailing) แยก train/test
   pa        ทดสอบกลยุทธ์ Price Action บน 1H (Breakout/Retest/Sweep) แยก train/test
 
@@ -1066,6 +1070,21 @@ def sim_chand(X, i, entry, sl, cost_px, mult=3.0, maxb=400):
     return (X["c"][end] - entry - cost_px) / risk, end
 
 
+def trade_stats_line(label, rs, years):
+    a = np.array(rs)
+    if len(a) == 0:
+        return f"{label}: ไม่มีเทรด"
+    streak = best = 0
+    for r in a:
+        streak = streak + 1 if r <= 0 else 0
+        best = max(best, streak)
+    eq = np.cumprod(1 + 0.02 * a)
+    peak = np.maximum.accumulate(eq)
+    dd = ((peak - eq) / peak).max() * 100
+    return (f"{label}: ชนะ {(a > 0).mean() * 100:.0f}% | เฉลี่ย {a.mean():+.2f}R | แพ้ติดกันสูงสุด {best} ไม้ | "
+            f"ไม้แพ้ใหญ่สุด {a.min():.1f}R | เสี่ยง 2%/ไม้ DD สูงสุด {dd:.0f}% (ตลอด {years:.0f} ปี)")
+
+
 def run_gold_research():
     df = download("GC=F", "1d", "max")
     if df is None or len(df) < 1500:
@@ -1131,6 +1150,12 @@ def run_gold_research():
         for sg, nm in ((1, "ซื้อ"), (-1, "ขาย")):
             seg = [x[1] for x in tr if x[0] >= split and x[2] == sg]
             lines.append(f"test ฝั่ง{nm}: {pa_line(seg)}")
+        lines.append("")
+        lines.append(trade_stats_line(f"ชุดที่เลือก N{key[0]}|{key[1]}|{key[2]}", [x[1] for x in sorted(tr)], years))
+        alt = ("N55", "both", "CHAND")
+        alt_key = (55, "both", "CHAND")
+        if alt_key in rows and alt_key != key:
+            lines.append(trade_stats_line("ชุดแนะนำ N55|both|CHAND", [x[1] for x in sorted(rows[alt_key])], years))
         if b_:
             per_year = len(tr) / years
             avg = float(np.mean(b_))
@@ -1140,6 +1165,128 @@ def run_gold_research():
     text = "\n".join(lines)
     print(text)
     send_long(text)
+
+
+# --------------------------------------------- บอททองรายวัน (N55 ซื้อ+ขาย Chandelier)
+GOLD_STATE = "gold_state.json"
+G_N = 55          # ทะลุกรอบสูง/ต่ำ 55 วัน
+G_SL_ATR = 2.0    # SL เริ่มต้น 2 ATR
+G_TRAIL_ATR = 3.0 # Chandelier 3 ATR
+
+
+def drop_unclosed_daily(df):
+    """แท่งรายวันของทองปิดราว 21-22 UTC ถือว่าปิดแล้วหลัง 22:30 UTC ของวันนั้น"""
+    now = pd.Timestamp.now(tz="UTC")
+    closed = df.index.normalize() + pd.Timedelta(hours=22, minutes=30)
+    return df[closed <= now]
+
+
+def _load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa
+        return default
+
+
+def gp(x):
+    return f"{x:,.2f}"
+
+
+def replay_gold(X, a, n, i, s):
+    """จำลองสถานะตั้งแต่แท่งสัญญาณ i: คืน (stop, entry, exit) ในหน่วยราคาจริง"""
+    e = X["o"][i + 1] if i + 1 < n else X["c"][i]
+    sl = e - G_SL_ATR * a[i]
+    stop, top = sl, e
+    for j in range(i + 1, n):
+        if X["l"][j] <= stop:
+            px = X["o"][j] if X["o"][j] < stop else stop
+            return s * stop, s * e, (j, s * px), s * sl
+        top = max(top, X["h"][j])
+        stop = max(stop, top - G_TRAIL_ATR * a[j])
+    return s * stop, s * e, None, s * sl
+
+
+GOLD_FOOT = {"text": "ตั้ง SL จริงที่โบรกเกอร์ทุกครั้ง บอทแจ้งหลังแท่งรายวันปิดเท่านั้น • ไม่ใช่คำแนะนำการลงทุน ผลไม่รับประกัน"}
+
+
+def run_gold_daily(status_only=False):
+    df = download("GC=F", "1d", "2y")
+    if df is None or len(df) < 260:
+        print("ข้อมูลทองไม่พอ")
+        return
+    df = drop_unclosed_daily(df)
+    n = len(df)
+    o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    a = atr_np(h, l, c, 20)
+    dates = [d.strftime("%Y-%m-%d") for d in df.index]
+    last = dates[-1]
+    views = {1: dict(o=o, h=h, l=l, c=c), -1: dict(o=-o, h=-l, l=-h, c=-c)}
+    st = _load_json(GOLD_STATE, {"pos": None, "last_bar": ""})
+    if not status_only and st.get("last_bar") == last:
+        print("ประมวลผลแท่งนี้แล้ว", last)
+        return
+    i = n - 1
+    hh = h[i - G_N:i].max()
+    ll = l[i - G_N:i].min()
+    pos = st.get("pos")
+    exited_now = False
+
+    if pos:
+        idx = [k for k, d in enumerate(dates) if d == pos["sig_date"]]
+        if not idx:
+            pos = None
+        else:
+            s_ = pos["side"]
+            stop, e, ex, sl0 = replay_gold(views[s_], a, n, idx[0], s_)
+            risk = abs(e - sl0)
+            name = "BUY 🟢" if s_ == 1 else "SELL 🔴"
+            if ex:
+                R = s_ * (ex[1] - e) / risk
+                if not status_only:
+                    send(embed={"title": f"🔔 ออกจากไม้ {name} ทอง", "color": 0xF1C40F,
+                                "description": f"ราคาแตะ SL ที่ประมาณ {gp(ex[1])} (เข้าอ้างอิง {gp(e)}) ผลประมาณ {R:+.1f}R\nรอสัญญาณใหม่ (บอทไม่เข้าซ้ำในแท่งเดียวกัน)",
+                                "footer": GOLD_FOOT})
+                    pos = None
+                    exited_now = (ex[0] == n - 1)
+            elif s_ * (stop - pos["last_stop"]) > 0.3 * a[i] and not status_only:
+                R_lock = s_ * (stop - e) / risk
+                send(embed={"title": f"📈 เลื่อน SL ไม้ {name} ทอง", "color": 0x3498DB,
+                            "description": f"เลื่อน SL ไปที่ **{gp(stop)}** (ถ้าโดนจะได้ประมาณ {R_lock:+.1f}R)\nราคาปิดล่าสุด {gp(c[i])}",
+                            "footer": GOLD_FOOT})
+                pos["last_stop"] = stop
+
+    if pos is None and not exited_now and not status_only:
+        s_ = 1 if c[i] > hh else (-1 if c[i] < ll else 0)
+        if s_:
+            sl = c[i] - s_ * G_SL_ATR * a[i]
+            name = "BUY 🟢" if s_ == 1 else "SELL 🔴"
+            lvl = hh if s_ == 1 else ll
+            send(embed={"title": f"{name} ทอง (XAUUSD) | เทรนด์ฟอลโลว์รายวัน",
+                        "color": 0x2ECC71 if s_ == 1 else 0xE74C3C,
+                        "description": (f"ราคาปิด {gp(c[i])} ทะลุกรอบ {'สูง' if s_ == 1 else 'ต่ำ'} 55 วัน ({gp(lvl)})\n"
+                                        f"**เข้า:** ราคาตลาด (อ้างอิง {gp(c[i])})\n"
+                                        f"**SL เริ่มต้น:** {gp(sl)} (ห่าง {gp(G_SL_ATR * a[i])} = 2 ATR)\n"
+                                        f"**ออก:** ไม่มี TP ตายตัว ใช้ SL เลื่อนตามแนวโน้ม บอทจะแจ้งทุกครั้งที่ควรเลื่อน\n"
+                                        f"**ขนาดไม้:** เสี่ยงไม่เกิน 1-2% ของพอร์ต ล็อต ≈ เงินที่ยอมเสีย ÷ (ระยะ SL × 100) (1 ล็อตมาตรฐาน = 100 ออนซ์)"),
+                        "footer": GOLD_FOOT})
+            pos = {"side": s_, "sig_date": last, "last_stop": sl}
+
+    if status_only or df.index[-1].weekday() == 4:
+        hh2 = h[n - G_N:n].max()
+        ll2 = l[n - G_N:n].min()
+        ptxt = "ไม่มีสถานะเปิด"
+        if pos:
+            ptxt = f"มีไม้ {'ซื้อ' if pos['side'] == 1 else 'ขาย'} เปิดอยู่ (สัญญาณ {pos['sig_date']}) SL ล่าสุด {gp(pos['last_stop'])}"
+        send(embed={"title": "สถานะบอททองรายวัน", "color": 0x95A5A6,
+                    "description": (f"แท่งล่าสุด {last} ปิด {gp(c[i])} | ATR20 {gp(a[i])}\n"
+                                    f"**ซื้อ** เมื่อปิดเหนือ {gp(hh2)} | **ขาย** เมื่อปิดต่ำกว่า {gp(ll2)} (กรอบ 55 วัน)\n{ptxt}"),
+                    "footer": GOLD_FOOT})
+    if not status_only:
+        st["pos"] = pos
+        st["last_bar"] = last
+        with open(GOLD_STATE, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
 
 # --------------------------------------------------------------------- main
 def main():
@@ -1153,10 +1300,18 @@ def main():
         run_pa_research()
     elif RUN_MODE == "gold":
         run_gold_research()
+    elif RUN_MODE == "daily":
+        run_gold_daily()
+    elif RUN_MODE == "daily_status":
+        run_gold_daily(status_only=True)
     elif RUN_MODE == "pa":
         run_pa_research()
     elif RUN_MODE == "gold":
         run_gold_research()
+    elif RUN_MODE == "daily":
+        run_gold_daily()
+    elif RUN_MODE == "daily_status":
+        run_gold_daily(status_only=True)
     else:
         run_live()
 
