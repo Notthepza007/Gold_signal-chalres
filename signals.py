@@ -6,6 +6,7 @@
   live      สแกนตลาดแล้วส่งซิกใหม่เข้า Discord (ค่าเริ่มต้น)
   test      ส่งข้อความทดสอบว่า Discord เชื่อมต่อได้
   backtest  ทดสอบกลยุทธ์ย้อนหลัง แล้วส่งสรุปวินเรทเข้า Discord
+  research  ทดสอบหลายชุดตัวกรอง แยก train/test เพื่อหาชุดที่ไม่ใช่แค่โชคดีย้อนหลัง
 
 หลักการ: เทรดตามเทรนด์ใหญ่ รอราคาย่อมาโซนมูลค่า (EMA21) แล้วมีแท่งเทียนยืนยัน
 ต้องผ่านหลายเงื่อนไขพร้อมกัน (RSI, MACD, ADX, EMA200) ใช้เฉพาะแท่งที่ปิดแล้ว (ไม่รีเพนต์)
@@ -40,9 +41,9 @@ TF_MIN = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 
 # need = จำนวนเงื่อนไขเสริม (จาก 4 ข้อ) ที่ต้องผ่าน, sweep = ต้องมีการกวาดสภาพคล่อง
 MODES = {
-    "SNIPER": dict(entry="15m", trend="4h", need=4, sweep=True, rr1=1.5, rr2=3.0, session=True),
-    "DAY": dict(entry="15m", trend="1h", need=3, sweep=False, rr1=1.5, rr2=2.5, session=True),
-    "SWING": dict(entry="4h", trend="1d", need=3, sweep=False, rr1=2.0, rr2=3.5, session=False),
+    "SNIPER": dict(entry="15m", trend="4h", t2="1d", need=4, sweep=True, rr1=1.5, rr2=3.0, session=True),
+    "DAY": dict(entry="15m", trend="1h", t2="4h", need=3, sweep=False, rr1=1.5, rr2=2.5, session=True),
+    "SWING": dict(entry="4h", trend="1d", t2=None, need=3, sweep=False, rr1=2.0, rr2=3.5, session=False),
 }
 MODE_TH = {"SNIPER": "Sniper", "DAY": "Day Trade", "SWING": "Swing"}
 
@@ -183,12 +184,16 @@ def check(X, i, cfg):
         return None
 
     # บังคับ 1: ย่อมาแตะโซนมูลค่า EMA21 ภายใน 6 แท่ง และยังยืนเหนือ EMA50
-    pull = X["l"][i - 5:i + 1].min() <= X["ema21"][i] + 0.25 * atr and c > X["ema50"][i]
+    zone = cfg.get("zone", "ema21")
+    pull = X["l"][i - 5:i + 1].min() <= X[zone][i] + 0.25 * atr and c > X["ema50"][i]
     # บังคับ 2: แท่งยืนยัน (ปิดเหนือ high แท่งก่อน หรือ pin bar หางล่างยาว)
     rng = h - l
     pin = rng > 0 and X["lw"][i] >= 2 * max(X["body"][i], 1e-12) and (c - l) / rng >= 0.66
     trig = (c > o and c > X["h"][i - 1]) or pin
     if not (pull and trig):
+        return None
+    adx_min = cfg.get("adx_min", 0)
+    if adx_min and not (X["adx"][i] >= adx_min and X["pdi"][i] > X["mdi"][i]):
         return None
 
     reasons = ["ย่อมาแตะโซน EMA21 ตามเทรนด์ใหญ่", "แท่งเทียนยืนยันการกลับตัว"]
@@ -228,13 +233,13 @@ def check(X, i, cfg):
                 max_score=6 + (1 if cfg["sweep"] else 0))
 
 
-def in_session(ts):
+def in_session(ts, hours=(7, 20)):
     """ช่วงลอนดอน+นิวยอร์ก (UTC 07-20) เลี่ยงเช้ามืดสภาพคล่องต่ำ และเย็นวันศุกร์"""
     if ts.weekday() >= 5:
         return False
     if ts.weekday() == 4 and ts.hour >= 18:
         return False
-    return 7 <= ts.hour < 20
+    return hours[0] <= ts.hour < hours[1]
 
 
 def prep(fr):
@@ -248,6 +253,10 @@ def mode_inputs(fr, trd, cfg):
     ent = fr[cfg["entry"]]
     times = ent.index + pd.Timedelta(minutes=TF_MIN[cfg["entry"]])
     tarr = htf_at(trd[cfg["trend"]], cfg["trend"], times).to_numpy()
+    t2 = cfg.get("trend2")
+    if t2:  # ต้องเทรนด์ตรงกันทั้งสองกรอบใหญ่
+        tarr2 = htf_at(trd[t2], t2, times).to_numpy()
+        tarr = np.where(tarr == tarr2, tarr, 0)
     return times, tarr
 
 
@@ -451,16 +460,100 @@ def run_backtest():
     send(content=msg[:1990])
 
 
-# --------------------------------------------------------------------- main
-def main():
-    if RUN_MODE == "test":
-        send(content="✅ ทดสอบสำเร็จ: บอทเชื่อมต่อ Discord ได้แล้ว")
-    elif RUN_MODE == "backtest":
-        run_backtest()
-    else:
-        run_live()
+
+# ----------------------------------------------------------------- research
+VARIANTS = {
+    "base": {},
+    "adx25": {"adx_min": 25},
+    "dual": {"dual": True},
+    "deep": {"zone": "ema50"},
+    "adx25+dual": {"adx_min": 25, "dual": True},
+    "adx25+dual+overlap": {"adx_min": 25, "dual": True, "hours": (12, 17)},
+}
+XRR = (1.5, 3.0)
+TRAIN_FRAC = 0.6
 
 
-if __name__ == "__main__":
-    main()
-  
+def resolve(mode, var):
+    cfg = dict(MODES[mode])
+    cfg.update({k: v for k, v in var.items() if k != "dual"})
+    if var.get("dual"):
+        cfg["trend2"] = MODES[mode].get("t2")
+    return cfg
+
+
+def short(rs):
+    st = stats(rs)
+    return "ไม่มีเทรด" if not st else f"{st[0]} ไม้ PF {st[3]:.2f} ({st[2]:+.2f}R)"
+
+
+def send_long(text):
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 1900:
+            send(content=chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        send(content=chunk)
+
+
+def run_research():
+    rows = {}  # (mode, variant, rr) -> list of (symbol, is_test, R)
+    for name, ticker in SYMBOLS.items():
+        fr = get_frames(ticker, deep=True)
+        if not fr:
+            print(name, "ไม่มีข้อมูล")
+            continue
+        trd, views = prep(fr)
+        for mode in MODES:
+            for vname, var in VARIANTS.items():
+                cfg = resolve(mode, var)
+                if var.get("dual") and not cfg.get("trend2"):
+                    continue  # โหมดนี้ไม่มีกรอบที่สอง
+                ent = fr[cfg["entry"]]
+                n = len(ent)
+                if n < WARMUP + 50:
+                    continue
+                times, tarr = mode_inputs(fr, trd, cfg)
+                V = views[cfg["entry"]]
+                split = int(n * TRAIN_FRAC)
+                hours = cfg.get("hours", (7, 20))
+                for rr in XRR:
+                    out = rows.setdefault((mode, vname, rr), [])
+                    i = WARMUP
+                    while i < n - 1:
+                        s_ = int(tarr[i])
+                        if s_ and (not cfg["session"] or in_session(times[i], hours)):
+                            r = check(V[s_], i, cfg)
+                            if r:
+                                R, j = simulate(V[s_], i, r, rr, n)
+                                out.append((name, i >= split, R))
+                                i = j + 1
+                                continue
+                        i += 1
+
+    for mode in MODES:
+        lines = [f"**Research: {MODE_TH[mode]}**  (train 60% เก่า | test 40% ล่าสุด ที่ไม่เคยใช้ปรับ)"]
+        best, best_pf = None, 0
+        passed = []
+        for (m, vname, rr), tr in rows.items():
+            if m != mode:
+                continue
+            a = [x[2] for x in tr if not x[1]]
+            b = [x[2] for x in tr if x[1]]
+            lines.append(f"{vname} TP{rr}R\n  train: {short(a)}\n  test: {short(b)}")
+            sa, sb = stats(a), stats(b)
+            if sa and sa[0] >= 40 and sa[3] > best_pf:
+                best, best_pf = (m, vname, rr), sa[3]
+            if sa and sb and sa[0] >= 40 and sb[0] >= 30 and sa[3] >= 1.15 and sb[3] >= 1.15:
+                passed.append(f"{vname} TP{rr}R")
+        lines.append("")
+        lines.append("ผ่านเกณฑ์ (PF ≥ 1.15 ทั้ง train และ test): " + (", ".join(passed) if passed else "ไม่มี"))
+        if best:
+            lines.append(f"\nรายคู่ของชุดที่ train ดีสุด ({best[1]} TP{best[2]}R):")
+            tr = rows[best]
+            for sym in SYMBOLS:
+                a = [x[2] for x in tr if x[0] == sym and not x[1]]
+                b = [x[2] for x in tr if x[0] == sym and x[1]]
+       
