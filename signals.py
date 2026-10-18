@@ -8,9 +8,11 @@
   daily_status  ส่งสถานะตอนนี้ (ระดับทะลุ ATR สถานะไม้) เพื่อเช็กว่าบอททำงาน
   journal       ส่งรายงานสมุดบันทึกเทรด + เช็กสุขภาพกลยุทธ์
   test          ส่งข้อความทดสอบว่า Discord เชื่อมต่อได้
+  basket        ทดสอบกฎเทรนด์ฟอลโลว์เดียวกันกับ 21 ตลาด (train/test + ทุนที่ต้องใช้สำหรับเป้ารายเดือน)
 """
 import os
 import json
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -75,6 +77,12 @@ def pf_of(rs):
         return 0.0
     gl = -a[a < 0].sum()
     return float("inf") if gl == 0 else a[a > 0].sum() / gl
+
+def pa_line(rs):
+    if not rs:
+        return "-"
+    return f"{len(rs)}/{pf_of(rs):.2f}"
+
 
 
 def _load_json(path, default):
@@ -248,6 +256,158 @@ def run_gold_daily(status_only=False):
             json.dump(st, f, ensure_ascii=False)
 
 
+TF_MIN = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+
+
+def drop_open_bar(df, tf):
+    """ตัดแท่งที่ยังไม่ปิดทิ้ง เพื่อไม่ให้สัญญาณรีเพนต์"""
+    now = datetime.now(timezone.utc)
+    end = df.index + pd.Timedelta(minutes=TF_MIN[tf])
+    return df[end <= now]
+
+
+def send_long(text):
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 1900:
+            send(content=chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        send(content=chunk)
+
+
+def sim_trail(X, i, entry, sl, cost_px, M=10, maxb=300):
+    risk = entry - sl
+    stop = sl
+    n = len(X["c"])
+    end = min(n - 1, i + maxb)
+    for j in range(i + 1, end + 1):
+        if X["l"][j] <= stop:
+            px = X["o"][j] if X["o"][j] < stop else stop
+            return (px - entry - cost_px) / risk, j
+        stop = max(stop, X["l"][j - M + 1:j + 1].min())
+    return (X["c"][end] - entry - cost_px) / risk, end
+
+
+def sim_chand(X, i, entry, sl, cost_px, mult=3.0, maxb=400):
+    """ออกด้วย Chandelier: สูงสุดนับจากเข้า ลบ mult*ATR (เลื่อนขึ้นอย่างเดียว)"""
+    risk = entry - sl
+    stop = sl
+    top = entry
+    n = len(X["c"])
+    end = min(n - 1, i + maxb)
+    for j in range(i + 1, end + 1):
+        if X["l"][j] <= stop:
+            px = X["o"][j] if X["o"][j] < stop else stop
+            return (px - entry - cost_px) / risk, j
+        top = max(top, X["h"][j])
+        stop = max(stop, top - mult * X["atr"][j])
+    return (X["c"][end] - entry - cost_px) / risk, end
+
+
+# ---------------------------------------------- ตะกร้าหลายตลาด (กฎเทรนด์ฟอลโลว์รายวันเดียวกัน)
+BASKET = {
+    "ทอง": "GC=F", "เงิน": "SI=F", "ทองแดง": "HG=F", "น้ำมันดิบ": "CL=F", "แก๊สธรรมชาติ": "NG=F",
+    "S&P500": "ES=F", "Nasdaq": "NQ=F", "Dow": "YM=F", "พันธบัตร10ปี": "ZN=F", "พันธบัตร30ปี": "ZB=F",
+    "ข้าวโพด": "ZC=F", "ถั่วเหลือง": "ZS=F", "ข้าวสาลี": "ZW=F",
+    "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X", "AUDUSD": "AUDUSD=X",
+    "USDCAD": "USDCAD=X", "USDCHF": "USDCHF=X", "NZDUSD": "NZDUSD=X", "Bitcoin": "BTC-USD",
+}
+SPLIT_DATE = "2016-01-01"
+THB_PER_USD = 34.0   # ประมาณการ
+
+
+def trend_trades(o, h, l, c, a, N=55):
+    """กฎเดียวกับบอททอง: ทะลุกรอบ N วัน ซื้อ/ขาย เข้าเปิดแท่งถัดไป SL 2 ATR + Chandelier 3 ATR"""
+    n = len(c)
+    views = {1: dict(o=o, h=h, l=l, c=c, atr=a), -1: dict(o=-o, h=-l, l=-h, c=-c, atr=a)}
+    hh = pd.Series(h).rolling(N).max().shift(1).to_numpy()
+    ll = pd.Series(l).rolling(N).min().shift(1).to_numpy()
+    out, i = [], N + 1
+    while i < n - 2:
+        sg = 1 if c[i] > hh[i] else (-1 if c[i] < ll[i] else 0)
+        if sg == 0:
+            i += 1
+            continue
+        X = views[sg]
+        e = X["o"][i + 1]
+        sl = e - 2 * a[i]
+        R, j = sim_chand(X, i, e, sl, 0.0003 * abs(e))
+        out.append((i + 1, j, R, sg))
+        i = j + 1
+    return out
+
+
+def run_basket():
+    allt = []   # (entry_date, exit_date, R, market)
+    lines = [f"**ตะกร้าเทรนด์ฟอลโลว์รายวัน {len(BASKET)} ตลาด** กฎเดียวกับบอททอง (กรอบ 55 วัน ซื้อ+ขาย) | train ก่อน {SPLIT_DATE} / test หลังจากนั้น",
+             "รูปแบบ ไม้/PF (ตัวอย่างน้อยกว่า 15 ไม้ ไม่น่าเชื่อถือ)"]
+    split = pd.Timestamp(SPLIT_DATE, tz="UTC")
+    for name, tk in BASKET.items():
+        df = download(tk, "1d", "max")
+        if df is None or len(df) < 800:
+            lines.append(f"{name}: ไม่มีข้อมูล")
+            continue
+        df = drop_open_bar(df, "1d")
+        df = df[(df[["open", "high", "low", "close"]] > 0).all(axis=1)]
+        o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+        a = atr_np(h, l, c, 20)
+        d = df.index
+        tr = trend_trades(o, h, l, c, a)
+        rec = [(d[min(i0, len(d) - 1)], d[min(j, len(d) - 1)], R, name) for i0, j, R, _ in tr]
+        allt += rec
+        a_ = [r[2] for r in rec if r[0] < split]
+        b_ = [r[2] for r in rec if r[0] >= split]
+        lines.append(f"{name}: train {pa_line(a_)} | test {pa_line(b_)}")
+    if not allt:
+        send(content="ไม่มีข้อมูลตะกร้า ลองรันใหม่")
+        return
+    a_ = [r[2] for r in allt if r[0] < split]
+    b_tr = sorted([r for r in allt if r[0] >= split], key=lambda r: r[1])
+    b_ = [r[2] for r in b_tr]
+    lines.append("")
+    lines.append(f"รวมตะกร้า: train {pa_line(a_)} | test {pa_line(b_)}")
+    if b_:
+        t0, t1 = split, max(r[1] for r in b_tr)
+        yrs = max((t1 - t0).days / 365.25, 0.5)
+        lines.append(f"ช่วง test {yrs:.1f} ปี: {len(b_) / yrs:.0f} ไม้/ปี (ราว {len(b_) / yrs / 12:.1f} ไม้/เดือน) | ชนะ {(np.array(b_) > 0).mean() * 100:.0f}% | เฉลี่ย {np.mean(b_):+.2f}R")
+        # ไม้เปิดพร้อมกัน
+        days = (t1 - t0).days or 1
+        held = sum((r[1] - r[0]).days for r in b_tr)
+        ev = sorted([(r[0], 1) for r in b_tr] + [(r[1], -1) for r in b_tr])
+        cur = mx = 0
+        for _, dlt in ev:
+            cur += dlt
+            mx = max(mx, cur)
+        lines.append(f"ไม้เปิดพร้อมกัน: เฉลี่ย {held / days:.1f} | สูงสุด {mx}")
+        for risk in (0.005, 0.01):
+            eq, peak, mdd = 1.0, 1.0, 0.0
+            by_year = {}
+            for _, ex, R, _ in b_tr:
+                eq *= 1 + risk * R
+                peak = max(peak, eq)
+                mdd = max(mdd, 1 - eq / peak)
+                by_year[ex.year] = eq
+            cagr = eq ** (1 / yrs) - 1
+            prev, yl = 1.0, []
+            for y in sorted(by_year):
+                yl.append(f"{y} {(by_year[y] / prev - 1) * 100:+.0f}%")
+                prev = by_year[y]
+            lines.append(f"\nเสี่ยง {risk * 100:.1f}%/ไม้: โตเฉลี่ย {cagr * 100:+.1f}%/ปี | DD สูงสุด {mdd * 100:.0f}% | แต่ละปี: " + " ".join(yl))
+            usd_month = 30000 / THB_PER_USD
+            if cagr > 0:
+                mret = (1 + cagr) ** (1 / 12) - 1
+                need = usd_month / mret
+                lines.append(f"→ เป้า 30,000 บาท/เดือน (≈ ${usd_month:,.0f}) ต้องมีทุนราว ${need:,.0f} (≈ {need * THB_PER_USD / 1e6:.1f} ล้านบาท) ที่ผลเฉลี่ยระดับนี้")
+            else:
+                lines.append("→ ช่วง test ไม่ได้กำไร จึงคำนวณทุนที่ต้องใช้ไม่ได้")
+    lines.append("\nหมายเหตุ: ข้อมูลฟิวเจอร์สต่อเนื่องของ Yahoo มีรอยต่อตอนเปลี่ยนสัญญา และราคาติดลบของน้ำมันปี 2020 ถูกตัดออก ผลจริงอาจต่างจากนี้")
+    text = "\n".join(lines)
+    print(text)
+    send_long(text)
+
+
 def main():
     if RUN_MODE == "test":
         send(content="✅ ทดสอบสำเร็จ: บอทเชื่อมต่อ Discord ได้แล้ว")
@@ -258,9 +418,11 @@ def main():
         send(content="\n".join(["**สมุดบันทึกบอททอง**"] + jl + warns))
     elif RUN_MODE == "daily":
         run_gold_daily()
+    elif RUN_MODE == "basket":
+        run_basket()
     else:
         print("ไม่มีโหมดนี้ในฉบับหลัก:", RUN_MODE)
-        send(content=f"โหมด `{RUN_MODE}` ไม่มีในไฟล์ฉบับหลัก ใช้ได้: daily, daily_status, journal, test")
+        send(content=f"โหมด `{RUN_MODE}` ไม่มีในไฟล์ฉบับหลัก ใช้ได้: daily, daily_status, journal, test, basket")
 
 
 if __name__ == "__main__":
