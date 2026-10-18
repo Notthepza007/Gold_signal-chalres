@@ -7,11 +7,15 @@
   test      ส่งข้อความทดสอบว่า Discord เชื่อมต่อได้
   backtest  ทดสอบกลยุทธ์ย้อนหลัง แล้วส่งสรุปวินเรทเข้า Discord
   daily         บอททองรายวัน (ซิกเข้า/เลื่อน SL/ออก) ตั้งเวลารันวันละครั้ง
+  journal       ส่งรายงานสมุดบันทึกเทรด + เช็กสุขภาพกลยุทธ์
+  wf            ทดสอบว่า "การเรียนรู้/ปรับพารามิเตอร์รายปี" ดีกว่าค่าคงที่ไหม (ทอง 26 ปี)
   daily_status  ส่งสถานะบอททองตอนนี้ (ระดับทะลุ ATR สถานะไม้) เพื่อเช็กว่าบอททำงาน
   gold      ทดสอบเทรนด์ฟอลโลว์ทองรายวัน 25 ปี (Donchian breakout + trailing) แยก train/test
   pa        ทดสอบกลยุทธ์ Price Action บน 1H (Breakout, Sweep, Retest) แยก train/test + จำลองพอร์ต
   research  ทดสอบหลายชุดตัวกรอง แยก train/test เพื่อหาชุดที่ไม่ใช่แค่โชคดีย้อนหลัง
   daily         บอททองรายวัน (ซิกเข้า/เลื่อน SL/ออก) ตั้งเวลารันวันละครั้ง
+  journal       ส่งรายงานสมุดบันทึกเทรด + เช็กสุขภาพกลยุทธ์
+  wf            ทดสอบว่า "การเรียนรู้/ปรับพารามิเตอร์รายปี" ดีกว่าค่าคงที่ไหม (ทอง 26 ปี)
   daily_status  ส่งสถานะบอททองตอนนี้ (ระดับทะลุ ATR สถานะไม้) เพื่อเช็กว่าบอททำงาน
   gold      ทดสอบเทรนด์ฟอลโลว์ทองรายวัน 25 ปี (Donchian breakout + trailing) แยก train/test
   pa        ทดสอบกลยุทธ์ Price Action บน 1H (Breakout/Retest/Sweep) แยก train/test
@@ -1167,6 +1171,54 @@ def run_gold_research():
     send_long(text)
 
 
+
+# ------------------------------------------------ สมุดบันทึกเทรด + ตรวจสุขภาพกลยุทธ์
+JOURNAL = "gold_journal.json"
+BT_EXPECT = "Backtest คาดไว้: ชนะ ~41% | เฉลี่ย +0.27R | แพ้ติดสูงสุด 5 ไม้ | DD ราว 6R"
+
+
+def journal_load():
+    j = _load_json(JOURNAL, [])
+    return j if isinstance(j, list) else []
+
+
+def journal_add(rec):
+    j = journal_load()
+    j.append(rec)
+    with open(JOURNAL, "w", encoding="utf-8") as f:
+        json.dump(j[-500:], f, ensure_ascii=False)
+
+
+def journal_stats(rs):
+    a = np.array(rs, dtype=float)
+    best = cur = 0
+    for r in a:
+        cur = cur + 1 if r <= 0 else 0
+        best = max(best, cur)
+    eq = np.cumsum(a)
+    dd = float((np.maximum.accumulate(eq) - eq).max())
+    return dict(n=len(a), win=float((a > 0).mean() * 100), avg=float(a.mean()), pf=pf_of(a),
+                cur=cur, best=best, dd=dd)
+
+
+def journal_lines():
+    rs = [t.get("R", 0) for t in journal_load()]
+    if not rs:
+        return ["สมุดบันทึก: ยังไม่มีไม้ที่ปิด"], []
+    st = journal_stats(rs)
+    lines = [f"สมุดบันทึก {st['n']} ไม้ | ชนะ {st['win']:.0f}% | เฉลี่ย {st['avg']:+.2f}R | PF {st['pf']:.2f} | "
+             f"แพ้ติดกัน (ปัจจุบัน/สูงสุด) {st['cur']}/{st['best']} | DD {st['dd']:.1f}R", BT_EXPECT]
+    warns = []
+    if st["cur"] >= 6:
+        warns.append("⚠️ แพ้ติดกัน ≥ 6 ไม้ เกินสถิติ Backtest (5) ควรทบทวนและลดความเสี่ยง")
+    if st["dd"] >= 12:
+        warns.append("🛑 DD ≥ 12R เป็น 2 เท่าของที่ Backtest คาด ควรหยุดเทรดจริงและตรวจสอบ")
+    elif st["dd"] >= 8:
+        warns.append("⚠️ DD ≥ 8R เริ่มเกินช่วงปกติของ Backtest (ราว 6R)")
+    if st["n"] >= 20 and st["avg"] < -0.1:
+        warns.append("⚠️ ผลเฉลี่ยติดลบหลัง 20 ไม้ ผลจริงเริ่มแย่กว่า Backtest")
+    return lines, warns
+
 # --------------------------------------------- บอททองรายวัน (N55 ซื้อ+ขาย Chandelier)
 GOLD_STATE = "gold_state.json"
 G_N = 55          # ทะลุกรอบสูง/ต่ำ 55 วัน
@@ -1244,8 +1296,13 @@ def run_gold_daily(status_only=False):
             if ex:
                 R = s_ * (ex[1] - e) / risk
                 if not status_only:
+                    journal_add({"side": s_, "sig": pos["sig_date"], "exit": dates[ex[0]],
+                                 "entry": round(e, 2), "exit_px": round(ex[1], 2), "R": round(R, 2)})
+                    jl, warns = journal_lines()
+                    extra = ("\n" + "\n".join(warns)) if warns else ""
                     send(embed={"title": f"🔔 ออกจากไม้ {name} ทอง", "color": 0xF1C40F,
-                                "description": f"ราคาแตะ SL ที่ประมาณ {gp(ex[1])} (เข้าอ้างอิง {gp(e)}) ผลประมาณ {R:+.1f}R\nรอสัญญาณใหม่ (บอทไม่เข้าซ้ำในแท่งเดียวกัน)",
+                                "description": (f"ราคาแตะ SL ที่ประมาณ {gp(ex[1])} (เข้าอ้างอิง {gp(e)}) ผลประมาณ {R:+.1f}R\n"
+                                                f"{jl[0]}{extra}\nรอสัญญาณใหม่ (บอทไม่เข้าซ้ำในแท่งเดียวกัน)"),
                                 "footer": GOLD_FOOT})
                     pos = None
                     exited_now = (ex[0] == n - 1)
@@ -1278,15 +1335,117 @@ def run_gold_daily(status_only=False):
         ptxt = "ไม่มีสถานะเปิด"
         if pos:
             ptxt = f"มีไม้ {'ซื้อ' if pos['side'] == 1 else 'ขาย'} เปิดอยู่ (สัญญาณ {pos['sig_date']}) SL ล่าสุด {gp(pos['last_stop'])}"
+        jl, warns = journal_lines()
         send(embed={"title": "สถานะบอททองรายวัน", "color": 0x95A5A6,
                     "description": (f"แท่งล่าสุด {last} ปิด {gp(c[i])} | ATR20 {gp(a[i])}\n"
-                                    f"**ซื้อ** เมื่อปิดเหนือ {gp(hh2)} | **ขาย** เมื่อปิดต่ำกว่า {gp(ll2)} (กรอบ 55 วัน)\n{ptxt}"),
+                                    f"**ซื้อ** เมื่อปิดเหนือ {gp(hh2)} | **ขาย** เมื่อปิดต่ำกว่า {gp(ll2)} (กรอบ 55 วัน)\n{ptxt}\n\n"
+                                    + "\n".join(jl + warns)),
                     "footer": GOLD_FOOT})
     if not status_only:
         st["pos"] = pos
         st["last_bar"] = last
         with open(GOLD_STATE, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False)
+
+
+# ----------------------------------- ทดสอบ "การเรียนรู้/ปรับตัว" ด้วยข้อมูลทอง 26 ปี
+def gold_trades(o, h, l, c, a, N, dirn, ex):
+    n = len(c)
+    views = {1: dict(o=o, h=h, l=l, c=c, atr=a), -1: dict(o=-o, h=-l, l=-h, c=-c, atr=a)}
+    hh = pd.Series(h).rolling(N).max().shift(1).to_numpy()
+    ll = pd.Series(l).rolling(N).min().shift(1).to_numpy()
+    trades = []
+    i = N + 1
+    while i < n - 2:
+        sg = 1 if c[i] > hh[i] else (-1 if (dirn == "both" and c[i] < ll[i]) else 0)
+        if sg == 0:
+            i += 1
+            continue
+        X = views[sg]
+        e = X["o"][i + 1]
+        sl = e - 2 * a[i]
+        cost_px = 0.0003 * abs(e)
+        if ex == "HALF":
+            R, j = sim_trail(X, i, e, sl, cost_px, M=max(N // 2, 5), maxb=400)
+        else:
+            R, j = sim_chand(X, i, e, sl, cost_px)
+        trades.append((i + 1, R, sg))
+        i = j + 1
+    return trades
+
+
+def run_gold_wf():
+    df = download("GC=F", "1d", "max")
+    if df is None or len(df) < 3000:
+        send(content="ดึงข้อมูลทองรายวันไม่สำเร็จ ลองรันใหม่อีกครั้ง")
+        return
+    df = drop_open_bar(df, "1d")
+    o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    a = atr_np(h, l, c, 20)
+    years = np.array([d.year for d in df.index])
+    cands = [(N, "both", ex) for N in (20, 55, 100) for ex in ("HALF", "CHAND")]
+    fixed = (55, "both", "CHAND")
+    byyear, alltr = {}, {}
+    for k in cands:
+        tr = gold_trades(o, h, l, c, a, k[0], k[1], k[2])
+        alltr[k] = tr
+        d = {}
+        for idx, R, _ in tr:
+            d.setdefault(int(years[idx]), []).append(R)
+        byyear[k] = d
+    y0, y1 = int(years[0]), int(years[-1])
+    start = y0 + 8
+    ad, fx, al, rows, win = [], [], [], [], 0
+    total_years = 0
+    for Y in range(start, y1 + 1):
+        best, bestv = None, -9.0
+        for k in cands:
+            rs = [r for y in range(Y - 8, Y) for r in byyear[k].get(y, [])]
+            if len(rs) >= 15 and np.mean(rs) > bestv:
+                best, bestv = k, float(np.mean(rs))
+        if best is None:
+            best = fixed
+        ar = byyear[best].get(Y, [])
+        fr = byyear[fixed].get(Y, [])
+        ad += ar
+        fx += fr
+        al += [r for k in cands for r in byyear[k].get(Y, [])]
+        total_years += 1
+        win += 1 if sum(ar) > sum(fr) else 0
+        rows.append(f"{Y}: เลือก N{best[0]}|{best[2]} {sum(ar):+.1f}R ({len(ar)}) | คงที่ {sum(fr):+.1f}R ({len(fr)})")
+
+    def line(label, rs):
+        if not rs:
+            return f"{label}: ไม่มีเทรด"
+        return f"{label}: {len(rs)} ไม้ | เฉลี่ย {np.mean(rs):+.2f}R | PF {pf_of(rs):.2f} | รวม {sum(rs):+.0f}R"
+
+    lines = [f"**ทดสอบการเรียนรู้/ปรับตัว (ทองรายวัน {start}-{y1})**",
+             "แต่ละปี บอทเลือกชุดพารามิเตอร์ที่ดีที่สุดจาก 8 ปีก่อนหน้า (ไม่แอบดูอนาคต) แล้วเทรดปีนั้น",
+             line("ปรับตัวรายปี", ad), line("ชุดคงที่ N55|both|CHAND", fx), line("สุ่มเลือกชุด (ค่าเฉลี่ยทุกชุด)", al),
+             f"ปีที่ปรับตัวชนะชุดคงที่: {win}/{total_years}"]
+    if ad and fx:
+        if sum(ad) - sum(fx) > 0.15 * abs(sum(fx)) and win / total_years >= 0.55:
+            lines.append("สรุป: การปรับตัวช่วยเล็กน้อย แต่ยังต้องระวังโชค")
+        else:
+            lines.append("สรุป: การปรับตัวไม่ได้ดีกว่าค่าคงที่อย่างมีนัยสำคัญ ไม่คุ้มความซับซ้อน ใช้ค่าคงที่ต่อ")
+    # กฎ 'เรียนรู้จากไม้แพ้ล่าสุด' ได้ผลไหม
+    tr = sorted(alltr[fixed])
+    buckets = {0: [], 1: [], 2: []}
+    streak = 0
+    for _, R, _ in tr:
+        buckets[min(streak, 2)].append(R)
+        streak = streak + 1 if R <= 0 else 0
+    lines.append("")
+    lines.append("ผลของไม้ถัดไป หลังแพ้ติดกัน (ชุดคงที่):")
+    for k_, nm in ((0, "หลังชนะ/เริ่มต้น"), (1, "หลังแพ้ 1 ไม้"), (2, "หลังแพ้ ≥ 2 ไม้")):
+        rs = buckets[k_]
+        lines.append(f"{nm}: {len(rs)} ไม้ เฉลี่ย {np.mean(rs):+.2f}R" if rs else f"{nm}: -")
+    lines.append("ถ้าตัวเลขสามบรรทัดนี้ไม่ต่างกันชัดเจน แปลว่าการ 'พักเทรดหลังแพ้' ไม่ช่วย")
+    lines.append("")
+    lines += rows
+    text = "\n".join(lines)
+    print(text)
+    send_long(text)
 
 # --------------------------------------------------------------------- main
 def main():
@@ -1304,6 +1463,11 @@ def main():
         run_gold_daily()
     elif RUN_MODE == "daily_status":
         run_gold_daily(status_only=True)
+    elif RUN_MODE == "journal":
+        jl, warns = journal_lines()
+        send(content="\n".join(["**สมุดบันทึกบอททอง**"] + jl + warns))
+    elif RUN_MODE == "wf":
+        run_gold_wf()
     elif RUN_MODE == "pa":
         run_pa_research()
     elif RUN_MODE == "gold":
@@ -1312,6 +1476,11 @@ def main():
         run_gold_daily()
     elif RUN_MODE == "daily_status":
         run_gold_daily(status_only=True)
+    elif RUN_MODE == "journal":
+        jl, warns = journal_lines()
+        send(content="\n".join(["**สมุดบันทึกบอททอง**"] + jl + warns))
+    elif RUN_MODE == "wf":
+        run_gold_wf()
     else:
         run_live()
 
